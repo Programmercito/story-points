@@ -83,12 +83,21 @@ func (b *Bot) sendGameList(chatID int64, games []db.Game) {
 	var rows [][]tgbotapi.InlineKeyboardButton
 	for _, g := range games {
 		label := fmt.Sprintf("%s • @%s • %s", g.ID[:8], g.CreatorUsername, statusLabel(g.Status))
+		var actionLabel, actionCallback string
+		if g.Status == db.GameStatusRevealed {
+			actionLabel = "Eliminar"
+			actionCallback = fmt.Sprintf("delete_game:%s", g.ID)
+		} else {
+			actionLabel = "Salir"
+			actionCallback = fmt.Sprintf("leave:%s", g.ID)
+		}
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(label, fmt.Sprintf("enter_game:%s", g.ID)),
+			tgbotapi.NewInlineKeyboardButtonData(actionLabel, actionCallback),
 		))
 	}
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
-	b.sendInlineKeyboard(chatID, "Tus juegos activos. Tocá uno para entrar:", keyboard)
+	b.sendInlineKeyboard(chatID, "Tus juegos. Tocá uno para entrar, o usá la acción de la derecha para gestionarlo:", keyboard)
 }
 
 func statusLabel(status db.GameStatus) string {
@@ -211,6 +220,8 @@ func (b *Bot) handleCallback(query *tgbotapi.CallbackQuery) {
 		b.handleReveal(query, parts[1])
 	case "leave":
 		b.handleLeave(query, parts[1])
+	case "delete_game":
+		b.handleDeleteGame(query, parts[1])
 	case "replay":
 		b.handleReplay(query, parts[1])
 	case "new_game":
@@ -400,6 +411,32 @@ func (b *Bot) handleReveal(query *tgbotapi.CallbackQuery, gameID string) {
 	b.sendInlineKeyboard(g.CreatorID, "¿Querés jugar de nuevo?", keyboard)
 }
 
+func (b *Bot) handleDeleteGame(query *tgbotapi.CallbackQuery, gameID string) {
+	g, err := db.GetGame(b.db, gameID)
+	if err != nil || g == nil {
+		b.answerCallback(query.ID, "Juego no encontrado.")
+		return
+	}
+
+	if err := db.LeaveGame(b.db, gameID, query.From.ID); err != nil {
+		b.answerCallback(query.ID, "No se pudo eliminar el juego de tu lista.")
+		log.Printf("delete game from list: %v", err)
+		return
+	}
+
+	b.answerCallback(query.ID, "Juego eliminado de tu lista.")
+
+	games, err := db.GetGamesByUser(b.db, query.From.ID)
+	if err != nil {
+		return
+	}
+	if len(games) == 0 {
+		b.editMessage(query.Message.Chat.ID, query.Message.MessageID, "No tenés más juegos activos. Usá /start para crear uno.", nil)
+		return
+	}
+	b.sendGameList(query.Message.Chat.ID, games)
+}
+
 func (b *Bot) handleLeave(query *tgbotapi.CallbackQuery, gameID string) {
 	g, err := db.GetGame(b.db, gameID)
 	if err != nil || g == nil {
@@ -548,6 +585,21 @@ func (b *Bot) renderGameMenu(chatID int64, g *db.Game, userID int64) {
 		b.sendInlineKeyboard(chatID, text, tgbotapi.NewInlineKeyboardMarkup(rows...))
 
 	case db.GameStatusVoting:
+		if userID == g.CreatorID {
+			votes, err := db.GetVotes(b.db, g.ID)
+			if err == nil {
+				progress := game.VotingProgress(players, votes)
+				b.sendText(chatID, fmt.Sprintf("Estado de la votación de tu juego:\n\n%s", progress))
+				if len(votes) == len(players) {
+					keyboard := tgbotapi.NewInlineKeyboardMarkup(
+						tgbotapi.NewInlineKeyboardRow(
+							tgbotapi.NewInlineKeyboardButtonData("Revelar votos", fmt.Sprintf("reveal:%s", g.ID)),
+						),
+					)
+					b.sendInlineKeyboard(chatID, "¡Todos votaron! Podés revelar los resultados.", keyboard)
+				}
+			}
+		}
 		b.sendVotingKeyboard(chatID, g, userID)
 
 	case db.GameStatusRevealed:

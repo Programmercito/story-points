@@ -76,13 +76,13 @@ func VotingProgress(activePlayers []db.Player, votes []db.Vote) string {
 		voted[v.UserID] = true
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Han votado %d de %d jugadores activos.\n\n", len(votes), len(activePlayers))
+	fmt.Fprintf(&b, "Progreso: %d de %d jugadores votaron.\n\n", len(votes), len(activePlayers))
 	for _, p := range activePlayers {
-		status := "pendiente"
 		if voted[p.UserID] {
-			status = "votó"
+			fmt.Fprintf(&b, "[V] @%s - votó\n", p.Username)
+		} else {
+			fmt.Fprintf(&b, "[ ] @%s - pendiente\n", p.Username)
 		}
-		fmt.Fprintf(&b, "- @%s (%s)\n", p.Username, status)
 	}
 	return b.String()
 }
