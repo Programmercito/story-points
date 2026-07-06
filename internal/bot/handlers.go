@@ -31,6 +31,10 @@ func (b *Bot) HandleUpdate(update tgbotapi.Update) {
 		b.handleCommand(update.Message)
 		return
 	}
+	if update.Message != nil {
+		b.showMainMenu(update.Message.Chat.ID)
+		return
+	}
 	if update.CallbackQuery != nil {
 		b.handleCallback(update.CallbackQuery)
 		return
@@ -43,8 +47,10 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 		b.handleStart(msg)
 	case "juegos":
 		b.handleJuegos(msg)
+	case "menu":
+		b.showMainMenu(msg.Chat.ID)
 	default:
-		b.sendText(msg.Chat.ID, "Comando no reconocido. Usá /start para comenzar o /juegos para ver tus partidas.")
+		b.sendText(msg.Chat.ID, "Comando no reconocido. Usá /start, /menu o /juegos.")
 	}
 }
 
@@ -76,15 +82,18 @@ func (b *Bot) handleJuegos(msg *tgbotapi.Message) {
 		return
 	}
 
-	b.sendGameList(msg.Chat.ID, games)
+	b.sendGameList(msg.Chat.ID, msg.From.ID, games)
 }
 
-func (b *Bot) sendGameList(chatID int64, games []db.Game) {
+func (b *Bot) sendGameList(chatID int64, userID int64, games []db.Game) {
 	var rows [][]tgbotapi.InlineKeyboardButton
 	for _, g := range games {
 		label := fmt.Sprintf("%s • @%s • %s", g.ID[:8], g.CreatorUsername, statusLabel(g.Status))
 		var actionLabel, actionCallback string
-		if g.Status == db.GameStatusRevealed {
+		if userID == g.CreatorID {
+			actionLabel = "Eliminar"
+			actionCallback = fmt.Sprintf("leave:%s", g.ID)
+		} else if g.Status == db.GameStatusRevealed {
 			actionLabel = "Eliminar"
 			actionCallback = fmt.Sprintf("delete_game:%s", g.ID)
 		} else {
@@ -170,7 +179,11 @@ func (b *Bot) joinGame(chatID int64, user *tgbotapi.User, gameID string) {
 	if g.Status == db.GameStatusWaiting {
 		text = fmt.Sprintf("Te uniste al juego creado por @%s.\n\nJugadores actuales:\n%s\n\nEsperá a que el organizador inicie la votación.", g.CreatorUsername, formatPlayerList(players))
 	} else {
-		text = fmt.Sprintf("Volviste al juego de @%s.\n\nJugadores activos:\n%s", g.CreatorUsername, formatPlayerList(players))
+		if exists {
+			text = fmt.Sprintf("Volviste al juego de @%s.\n\nJugadores activos:\n%s", g.CreatorUsername, formatPlayerList(players))
+		} else {
+			text = fmt.Sprintf("Te uniste al juego de @%s que ya está votando.\n\nJugadores activos:\n%s\n\nElegí tu story point:", g.CreatorUsername, formatPlayerList(players))
+		}
 		b.sendVotingKeyboard(chatID, g, user.ID)
 	}
 
@@ -194,6 +207,23 @@ func (b *Bot) notifyCreatorPlayerJoined(g *db.Game, p *db.Player) {
 		)
 		b.sendInlineKeyboard(g.CreatorID, text, keyboard)
 		return
+	}
+
+	if g.Status == db.GameStatusVoting {
+		votes, err := db.GetVotes(b.db, g.ID)
+		if err == nil {
+			progress := game.VotingProgress(players, votes)
+			b.sendText(g.CreatorID, fmt.Sprintf("%s\n\n%s", text, progress))
+			if len(votes) == len(players) {
+				keyboard := tgbotapi.NewInlineKeyboardMarkup(
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("Revelar votos", fmt.Sprintf("reveal:%s", g.ID)),
+					),
+				)
+				b.sendInlineKeyboard(g.CreatorID, "¡Todos los jugadores votaron! Podés revelar los resultados.", keyboard)
+			}
+			return
+		}
 	}
 
 	b.sendText(g.CreatorID, text)
@@ -280,7 +310,9 @@ func (b *Bot) handleStartGame(query *tgbotapi.CallbackQuery, gameID string) {
 		return
 	}
 
-	b.editMessage(query.Message.Chat.ID, query.Message.MessageID, "El juego comenzó. Se enviaron los teclados de votación a cada jugador.", nil)
+	link := game.DeepLink(b.botUsername, g.ID)
+	editText := fmt.Sprintf("El juego comenzó. Se enviaron los teclados de votación a cada jugador.\n\nLink para nuevos participantes:\n%s\n\nCódigo: `%s`", link, g.ID)
+	b.editMessage(query.Message.Chat.ID, query.Message.MessageID, editText, nil)
 
 	for _, p := range players {
 		b.sendVotingKeyboard(p.UserID, g, p.UserID)
@@ -434,12 +466,37 @@ func (b *Bot) handleDeleteGame(query *tgbotapi.CallbackQuery, gameID string) {
 		b.editMessage(query.Message.Chat.ID, query.Message.MessageID, "No tenés más juegos activos. Usá /start para crear uno.", nil)
 		return
 	}
-	b.sendGameList(query.Message.Chat.ID, games)
+	b.sendGameList(query.Message.Chat.ID, query.From.ID, games)
 }
 
 func (b *Bot) handleLeave(query *tgbotapi.CallbackQuery, gameID string) {
 	g, err := db.GetGame(b.db, gameID)
 	if err != nil || g == nil {
+		return
+	}
+
+	if query.From.ID == g.CreatorID {
+		players, err := db.GetActivePlayers(b.db, gameID)
+		if err != nil {
+			log.Printf("get active players: %v", err)
+			return
+		}
+
+		if err := db.DeleteGame(b.db, gameID); err != nil {
+			b.answerCallback(query.ID, "No se pudo eliminar el juego.")
+			log.Printf("delete game: %v", err)
+			return
+		}
+
+		b.answerCallback(query.ID, "Eliminaste el juego.")
+		b.editMessage(query.Message.Chat.ID, query.Message.MessageID, "Eliminaste el juego. Ya no aparece en tu lista ni en la de los demás participantes.", nil)
+
+		for _, p := range players {
+			if p.UserID == g.CreatorID {
+				continue
+			}
+			b.sendText(p.UserID, fmt.Sprintf("El organizador @%s eliminó el juego. Ya no está disponible.", g.CreatorUsername))
+		}
 		return
 	}
 
@@ -450,11 +507,6 @@ func (b *Bot) handleLeave(query *tgbotapi.CallbackQuery, gameID string) {
 
 	b.answerCallback(query.ID, "Te saliste del juego.")
 	b.editMessage(query.Message.Chat.ID, query.Message.MessageID, "Te saliste del juego. Podés volver a entrar con el link si todavía está abierto.", nil)
-
-	if query.From.ID == g.CreatorID {
-		b.sendText(g.CreatorID, "Abandonaste tu propio juego. El juego queda sin organizador.")
-		return
-	}
 
 	players, err := db.GetActivePlayers(b.db, gameID)
 	if err != nil {
@@ -536,7 +588,7 @@ func (b *Bot) handleMyGamesCallback(query *tgbotapi.CallbackQuery) {
 		return
 	}
 
-	b.sendGameList(query.Message.Chat.ID, games)
+	b.sendGameList(query.Message.Chat.ID, query.From.ID, games)
 }
 
 func (b *Bot) handleEnterGame(query *tgbotapi.CallbackQuery, gameID string) {

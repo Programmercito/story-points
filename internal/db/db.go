@@ -337,3 +337,11 @@ func DeleteVotes(db *sql.DB, gameID string) error {
 	}
 	return nil
 }
+
+func DeleteGame(db *sql.DB, gameID string) error {
+	_, err := db.Exec(`DELETE FROM games WHERE id = ?`, gameID)
+	if err != nil {
+		return fmt.Errorf("delete game: %w", err)
+	}
+	return nil
+}
