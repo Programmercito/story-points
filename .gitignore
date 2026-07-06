@@ -1,0 +1,6 @@
+.env
+*.db
+*.db-journal
+story-points
+/bin
+/dist
