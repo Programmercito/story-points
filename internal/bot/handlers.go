@@ -13,15 +13,17 @@ import (
 )
 
 type Bot struct {
-	api        *tgbotapi.BotAPI
-	db         *sql.DB
+	api         TelegramAPI
+	db          *sql.DB
+	sender      *Sender
 	botUsername string
 }
 
-func New(api *tgbotapi.BotAPI, database *sql.DB, botUsername string) *Bot {
+func New(api TelegramAPI, database *sql.DB, sender *Sender, botUsername string) *Bot {
 	return &Bot{
 		api:         api,
 		db:          database,
+		sender:      sender,
 		botUsername: botUsername,
 	}
 }
@@ -231,9 +233,7 @@ func (b *Bot) notifyCreatorPlayerJoined(g *db.Game, p *db.Player) {
 
 func (b *Bot) handleCallback(query *tgbotapi.CallbackQuery) {
 	defer func() {
-		if _, err := b.api.Request(tgbotapi.NewCallback(query.ID, "")); err != nil {
-			log.Printf("answer callback: %v", err)
-		}
+		b.answerCallback(query.ID, "")
 	}()
 
 	parts := strings.SplitN(query.Data, ":", 3)
@@ -248,6 +248,8 @@ func (b *Bot) handleCallback(query *tgbotapi.CallbackQuery) {
 		b.handleVote(query, parts[1], parts[2])
 	case "reveal":
 		b.handleReveal(query, parts[1])
+	case "reset_votes":
+		b.handleResetVotes(query, parts[1])
 	case "leave":
 		b.handleLeave(query, parts[1])
 	case "delete_game":
@@ -278,9 +280,12 @@ func (b *Bot) handleCreateGame(query *tgbotapi.CallbackQuery) {
 	}
 
 	link := game.DeepLink(b.botUsername, g.ID)
-	text := fmt.Sprintf("Nuevo juego creado.\n\nCompartí este link para que se unan:\n%s\n\nCódigo: `%s`", link, g.ID)
+	text := fmt.Sprintf("Nuevo juego creado.\n\nComparte este link para que se unan:\n%s", link)
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonURL("Abrir link para unirse", link),
+		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("Empezar juego", fmt.Sprintf("start_game:%s", g.ID)),
 		),
@@ -311,7 +316,7 @@ func (b *Bot) handleStartGame(query *tgbotapi.CallbackQuery, gameID string) {
 	}
 
 	link := game.DeepLink(b.botUsername, g.ID)
-	editText := fmt.Sprintf("El juego comenzó. Se enviaron los teclados de votación a cada jugador.\n\nLink para nuevos participantes:\n%s\n\nCódigo: `%s`", link, g.ID)
+	editText := fmt.Sprintf("El juego comenzó. Se enviaron los teclados de votación a cada jugador.\n\nLink para nuevos participantes:\n%s", link)
 	b.editMessage(query.Message.Chat.ID, query.Message.MessageID, editText, nil)
 
 	for _, p := range players {
@@ -319,32 +324,39 @@ func (b *Bot) handleStartGame(query *tgbotapi.CallbackQuery, gameID string) {
 	}
 }
 
-func (b *Bot) sendVotingKeyboard(chatID int64, g *db.Game, userID int64) {
+func (b *Bot) votingKeyboard(g *db.Game, userID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 	opts := game.Options()
+	hasVoted, _ := db.HasVoted(b.db, g.ID, userID)
+
 	var rows [][]tgbotapi.InlineKeyboardButton
-	var current []tgbotapi.InlineKeyboardButton
-	for i, opt := range opts {
-		current = append(current, tgbotapi.NewInlineKeyboardButtonData(opt, fmt.Sprintf("vote:%s:%s", g.ID, opt)))
-		if (i+1)%4 == 0 {
-			rows = append(rows, current)
-			current = nil
+	if !hasVoted {
+		var current []tgbotapi.InlineKeyboardButton
+		for i, opt := range opts {
+			current = append(current, tgbotapi.NewInlineKeyboardButtonData(opt, fmt.Sprintf("vote:%s:%s", g.ID, opt)))
+			if (i+1)%4 == 0 {
+				rows = append(rows, current)
+				current = nil
+			}
 		}
-	}
-	if len(current) > 0 {
-		rows = append(rows, current)
+		if len(current) > 0 {
+			rows = append(rows, current)
+		}
 	}
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 		tgbotapi.NewInlineKeyboardButtonData("Salir del juego", fmt.Sprintf("leave:%s", g.ID)),
 		tgbotapi.NewInlineKeyboardButtonData("Mis juegos", "my_games"),
 	))
 
-	hasVoted, _ := db.HasVoted(b.db, g.ID, userID)
 	text := fmt.Sprintf("Juego de @%s\n\nElegí tu story point:", g.CreatorUsername)
 	if hasVoted {
-		text += "\n\nYa votaste. Podés cambiar tu voto presionando otra opción."
+		text = fmt.Sprintf("Juego de @%s\n\nYa votaste. Esperá a que el organizador revele o relance la votación.", g.CreatorUsername)
 	}
 
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
+	return text, tgbotapi.NewInlineKeyboardMarkup(rows...)
+}
+
+func (b *Bot) sendVotingKeyboard(chatID int64, g *db.Game, userID int64) {
+	text, keyboard := b.votingKeyboard(g, userID)
 	b.sendInlineKeyboard(chatID, text, keyboard)
 }
 
@@ -367,12 +379,27 @@ func (b *Bot) handleVote(query *tgbotapi.CallbackQuery, gameID, value string) {
 		return
 	}
 
+	hasVoted, err := db.HasVoted(b.db, gameID, query.From.ID)
+	if err != nil {
+		return
+	}
+	if hasVoted {
+		b.answerCallback(query.ID, "Ya votaste. No podés cambiar tu voto.")
+		return
+	}
+
 	if err := db.CastVote(b.db, gameID, query.From.ID, query.From.UserName, value); err != nil {
 		log.Printf("cast vote: %v", err)
 		return
 	}
 
 	b.answerCallback(query.ID, fmt.Sprintf("Votaste %s", value))
+
+	// Actualizar el mensaje del jugador para que no pueda votar de nuevo.
+	if query.Message != nil {
+		text, keyboard := b.votingKeyboard(g, query.From.ID)
+		b.editMessage(query.Message.Chat.ID, query.Message.MessageID, text, &keyboard)
+	}
 
 	votes, err := db.GetVotes(b.db, gameID)
 	if err != nil {
@@ -386,9 +413,10 @@ func (b *Bot) handleVote(query *tgbotapi.CallbackQuery, gameID, value string) {
 		keyboard := tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(
 				tgbotapi.NewInlineKeyboardButtonData("Revelar votos", fmt.Sprintf("reveal:%s", g.ID)),
+				tgbotapi.NewInlineKeyboardButtonData("Relanzar votación", fmt.Sprintf("reset_votes:%s", g.ID)),
 			),
 		)
-		b.sendInlineKeyboard(g.CreatorID, "¡Todos los jugadores votaron! Podés revelar los resultados.", keyboard)
+		b.sendInlineKeyboard(g.CreatorID, "¡Todos los jugadores votaron! Podés revelar los resultados o relanzar la votación.", keyboard)
 	}
 }
 
@@ -441,6 +469,41 @@ func (b *Bot) handleReveal(query *tgbotapi.CallbackQuery, gameID string) {
 		),
 	)
 	b.sendInlineKeyboard(g.CreatorID, "¿Querés jugar de nuevo?", keyboard)
+}
+
+func (b *Bot) handleResetVotes(query *tgbotapi.CallbackQuery, gameID string) {
+	g, err := db.GetGame(b.db, gameID)
+	if err != nil || g == nil {
+		return
+	}
+	if query.From.ID != g.CreatorID {
+		b.answerCallback(query.ID, "Solo el organizador puede relanzar la votación.")
+		return
+	}
+	if g.Status != db.GameStatusVoting {
+		b.answerCallback(query.ID, "La votación no está activa.")
+		return
+	}
+
+	if err := db.DeleteVotes(b.db, gameID); err != nil {
+		log.Printf("delete votes: %v", err)
+		return
+	}
+
+	b.answerCallback(query.ID, "Votación relanzada.")
+
+	players, err := db.GetActivePlayers(b.db, gameID)
+	if err != nil {
+		log.Printf("get active players: %v", err)
+		return
+	}
+
+	for _, p := range players {
+		b.sendVotingKeyboard(p.UserID, g, p.UserID)
+	}
+
+	progress := game.VotingProgress(players, nil)
+	b.sendText(g.CreatorID, fmt.Sprintf("Relanzaste la votación.\n\n%s", progress))
 }
 
 func (b *Bot) handleDeleteGame(query *tgbotapi.CallbackQuery, gameID string) {
@@ -553,9 +616,12 @@ func (b *Bot) handleReplay(query *tgbotapi.CallbackQuery, oldGameID string) {
 	}
 
 	link := game.DeepLink(b.botUsername, g.ID)
-	text := fmt.Sprintf("Nueva ronda creada.\n\nLink para unirse:\n%s\n\nCódigo: `%s`", link, g.ID)
+	text := fmt.Sprintf("Nueva ronda creada.\n\nLink para unirse:\n%s", link)
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonURL("Abrir link para unirse", link),
+		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("Empezar juego", fmt.Sprintf("start_game:%s", g.ID)),
 		),
@@ -622,8 +688,11 @@ func (b *Bot) renderGameMenu(chatID int64, g *db.Game, userID int64) {
 	switch g.Status {
 	case db.GameStatusWaiting:
 		link := game.DeepLink(b.botUsername, g.ID)
-		text := fmt.Sprintf("Juego de @%s\n\nEstado: esperando jugadores\nLink: %s\n\nJugadores (%d):\n%s", g.CreatorUsername, link, len(players), formatPlayerList(players))
+		text := fmt.Sprintf("Juego de @%s\n\nEstado: esperando jugadores\n\nLink para unirse:\n%s\n\nJugadores (%d):\n%s", g.CreatorUsername, link, len(players), formatPlayerList(players))
 		var rows [][]tgbotapi.InlineKeyboardButton
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonURL("Abrir link para unirse", link),
+		))
 		if userID == g.CreatorID {
 			rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 				tgbotapi.NewInlineKeyboardButtonData("Empezar juego", fmt.Sprintf("start_game:%s", g.ID)),
@@ -642,13 +711,18 @@ func (b *Bot) renderGameMenu(chatID int64, g *db.Game, userID int64) {
 			if err == nil {
 				progress := game.VotingProgress(players, votes)
 				b.sendText(chatID, fmt.Sprintf("Estado de la votación de tu juego:\n\n%s", progress))
+
+				var rows [][]tgbotapi.InlineKeyboardButton
+				rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("Relanzar votación", fmt.Sprintf("reset_votes:%s", g.ID)),
+				))
 				if len(votes) == len(players) {
-					keyboard := tgbotapi.NewInlineKeyboardMarkup(
-						tgbotapi.NewInlineKeyboardRow(
-							tgbotapi.NewInlineKeyboardButtonData("Revelar votos", fmt.Sprintf("reveal:%s", g.ID)),
-						),
-					)
-					b.sendInlineKeyboard(chatID, "¡Todos votaron! Podés revelar los resultados.", keyboard)
+					rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("Revelar votos", fmt.Sprintf("reveal:%s", g.ID)),
+					))
+					b.sendInlineKeyboard(chatID, "¡Todos votaron! Podés revelar los resultados o relanzar la votación.", tgbotapi.NewInlineKeyboardMarkup(rows...))
+				} else {
+					b.sendInlineKeyboard(chatID, "Podés relanzar la votación cuando quieras.", tgbotapi.NewInlineKeyboardMarkup(rows...))
 				}
 			}
 		}
@@ -678,37 +752,38 @@ func (b *Bot) renderGameMenu(chatID int64, g *db.Game, userID int64) {
 }
 
 func (b *Bot) sendText(chatID int64, text string) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = tgbotapi.ModeMarkdown
-	if _, err := b.api.Send(msg); err != nil {
-		log.Printf("send text: %v", err)
-	}
+	b.sender.Queue(OutboxMessage{
+		Type:   messageTypeText,
+		ChatID: chatID,
+		Text:   text,
+	})
 }
 
 func (b *Bot) sendInlineKeyboard(chatID int64, text string, keyboard tgbotapi.InlineKeyboardMarkup) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = tgbotapi.ModeMarkdown
-	msg.ReplyMarkup = keyboard
-	if _, err := b.api.Send(msg); err != nil {
-		log.Printf("send inline keyboard: %v", err)
-	}
+	b.sender.Queue(OutboxMessage{
+		Type:     messageTypeKeyboard,
+		ChatID:   chatID,
+		Text:     text,
+		Keyboard: &keyboard,
+	})
 }
 
 func (b *Bot) editMessage(chatID int64, messageID int, text string, keyboard *tgbotapi.InlineKeyboardMarkup) {
-	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
-	edit.ParseMode = tgbotapi.ModeMarkdown
-	if keyboard != nil {
-		edit.ReplyMarkup = keyboard
-	}
-	if _, err := b.api.Request(edit); err != nil {
-		log.Printf("edit message: %v", err)
-	}
+	b.sender.Queue(OutboxMessage{
+		Type:      messageTypeEdit,
+		ChatID:    chatID,
+		Text:      text,
+		MessageID: messageID,
+		Keyboard:  keyboard,
+	})
 }
 
 func (b *Bot) answerCallback(callbackID, text string) {
-	if _, err := b.api.Request(tgbotapi.NewCallback(callbackID, text)); err != nil {
-		log.Printf("answer callback: %v", err)
-	}
+	b.sender.Queue(OutboxMessage{
+		Type:       messageTypeCallback,
+		CallbackID: callbackID,
+		Text:       text,
+	})
 }
 
 func hasUsername(user *tgbotapi.User) bool {

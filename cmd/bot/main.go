@@ -40,7 +40,11 @@ func main() {
 
 	log.Printf("Bot autorizado como @%s", api.Self.UserName)
 
-	handler := bot.New(api, database, api.Self.UserName)
+	sender := bot.NewSender(api)
+	sender.Start()
+	defer sender.Stop()
+
+	handler := bot.New(api, database, sender, api.Self.UserName)
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60

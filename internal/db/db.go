@@ -219,13 +219,21 @@ func StartGame(db *sql.DB, gameID string) error {
 }
 
 func CastVote(db *sql.DB, gameID string, userID int64, username, value string) error {
-	_, err := db.Exec(
+	res, err := db.Exec(
 		`INSERT INTO votes (game_id, user_id, username, value) VALUES (?, ?, ?, ?)
-		 ON CONFLICT(game_id, user_id) DO UPDATE SET value = excluded.value, username = excluded.username`,
+		 ON CONFLICT(game_id, user_id) DO NOTHING`,
 		gameID, userID, username, value,
 	)
 	if err != nil {
 		return fmt.Errorf("cast vote: %w", err)
+	}
+
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("already voted")
 	}
 	return nil
 }
