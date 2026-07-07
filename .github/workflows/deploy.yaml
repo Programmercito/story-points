@@ -1,0 +1,58 @@
+name: deployer
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+
+    - name: Build
+      run: |
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bot ./cmd/bot
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: story-points-files
+        path: |
+          bot
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - name: Download artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: story-points-files
+
+    - name: config copy files
+      run: |
+        mkdir -p ~/.ssh
+        touch ~/.ssh/known_hosts
+        ssh-keyscan -H ${{ secrets.SERVER }} >> ~/.ssh/known_hosts
+
+    - name: Deploy to production
+      run: |
+        echo "${{ secrets.KEY }}" > ./private_key
+        chmod 600 ./private_key
+        ls -la
+        ssh -o StrictHostKeyChecking=no -i ./private_key ${{ secrets.USER }}@${{ secrets.SERVER }} "cd /opt/story-points && rm -rf *"
+        ssh -o StrictHostKeyChecking=no -i ./private_key ${{ secrets.USER }}@${{ secrets.SERVER }} "cd /opt/codes/bot-dockers && git pull"
+        scp -o StrictHostKeyChecking=no -i ./private_key bot ${{ secrets.USER }}@${{ secrets.SERVER }}:/opt/story-points/
+        ssh -o StrictHostKeyChecking=no -i ./private_key ${{ secrets.USER }}@${{ secrets.SERVER }} "cp /opt/codes/bot-dockers/story-points/docker/story-points.dockerfile /opt/story-points"
+        ssh -o StrictHostKeyChecking=no -i ./private_key ${{ secrets.USER }}@${{ secrets.SERVER }} "cd /opt/story-points && ls -la"
+        ssh -o StrictHostKeyChecking=no -i ./private_key ${{ secrets.USER }}@${{ secrets.SERVER }} "docker build -t localhost:32000/story-points:latest -f /opt/story-points/story-points.dockerfile /opt/story-points/"
+        ssh -o StrictHostKeyChecking=no -i ./private_key ${{ secrets.USER }}@${{ secrets.SERVER }} "docker push localhost:32000/story-points:latest"
+        ssh -o StrictHostKeyChecking=no -i ./private_key ${{ secrets.USER }}@${{ secrets.SERVER }} "microk8s kubectl apply -f /opt/codes/bot-dockers/story-points/kub/services.yaml"
+        ssh -o StrictHostKeyChecking=no -i ./private_key ${{ secrets.USER }}@${{ secrets.SERVER }} "microk8s kubectl rollout restart deployment/story-points -n story-points"
