@@ -18,14 +18,14 @@ jobs:
 
     - name: Build
       run: |
-        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bot ./cmd/bot
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o story-points ./cmd/bot
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: story-points-files
         path: |
-          bot
+          story-points
 
   deploy:
     runs-on: ubuntu-latest
@@ -49,7 +49,7 @@ jobs:
         ls -la
         ssh -o StrictHostKeyChecking=no -i ./private_key ${{ secrets.USER }}@${{ secrets.SERVER }} "cd /opt/story-points && rm -rf *"
         ssh -o StrictHostKeyChecking=no -i ./private_key ${{ secrets.USER }}@${{ secrets.SERVER }} "cd /opt/codes/bot-dockers && git pull"
-        scp -o StrictHostKeyChecking=no -i ./private_key bot ${{ secrets.USER }}@${{ secrets.SERVER }}:/opt/story-points/
+        scp -o StrictHostKeyChecking=no -i ./private_key story-points ${{ secrets.USER }}@${{ secrets.SERVER }}:/opt/story-points/
         ssh -o StrictHostKeyChecking=no -i ./private_key ${{ secrets.USER }}@${{ secrets.SERVER }} "cp /opt/codes/bot-dockers/story-points/docker/story-points.dockerfile /opt/story-points"
         ssh -o StrictHostKeyChecking=no -i ./private_key ${{ secrets.USER }}@${{ secrets.SERVER }} "cd /opt/story-points && ls -la"
         ssh -o StrictHostKeyChecking=no -i ./private_key ${{ secrets.USER }}@${{ secrets.SERVER }} "docker build -t localhost:32000/story-points:latest -f /opt/story-points/story-points.dockerfile /opt/story-points/"
